@@ -1,7 +1,9 @@
 package com.xiaoyang.query.dao.impl;
 
 import java.io.Serializable;
+import java.lang.reflect.Array;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
@@ -15,6 +17,7 @@ import java.util.stream.Stream;
 
 import org.apache.commons.beanutils.BeanUtils;
 import org.apache.commons.lang3.ArrayUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import com.querydsl.core.QueryFlag.Position;
@@ -33,6 +36,8 @@ import com.querydsl.sql.SQLExpressions;
 import com.querydsl.sql.dml.DefaultMapper;
 import com.querydsl.sql.dml.SQLInsertClause;
 import com.xiaoyang.query.dao.IDAO;
+import com.xiaoyang.query.enums.PredicateBorder;
+import com.xiaoyang.query.enums.PredicateType;
 import com.xiaoyang.query.operater.DBOperater;
 import com.xiaoyang.query.util.QueryBeanUtil;
 
@@ -79,6 +84,106 @@ public abstract class AbstractDao<M extends RelationalPathBase<E>, E, ID extends
 	}
 
 	/**
+	 * 解析查询参数，自动生成查询条件
+	 * 
+	 * @param query
+	 * @return
+	 */
+	protected List<Predicate> parseQueryParams(Object query) {
+		Class<?> clazz = query.getClass();
+		List<Predicate> predicates = new ArrayList<>();
+		for (; clazz != Object.class; clazz = clazz.getSuperclass()) {
+			Field[] fields = clazz.getDeclaredFields();
+			for (Field field : fields) {
+				// predicates.add(e)
+				com.xiaoyang.query.annotation.Predicate[] annotations = field
+						.getAnnotationsByType(com.xiaoyang.query.annotation.Predicate.class);
+				if (ArrayUtils.isNotEmpty(annotations)) {
+					if (annotations.length > 1) {
+						throw new RuntimeException("Predicate 注解在同一个属性上含有多个");
+					}
+					field.setAccessible(true);
+					Object fieldValue = null;
+					try {
+						fieldValue = field.get(query);
+					} catch (Exception e) {
+						throw new RuntimeException(e);
+					}
+					com.xiaoyang.query.annotation.Predicate predicate = annotations[0];
+					/*
+					 * 1.解析注解上的字段，如果没指定映射的数据库字段，则默认使用类字段名称 2.字段默认匹配方式，数组类和集合类默认使用in ，其他使用eq
+					 */
+					String filedName = predicate.field();
+					if (StringUtils.isBlank(filedName)) {
+						filedName = field.getName();
+					}
+					PredicateType predicateType = predicate.type();
+					if (predicateType == null) {
+						if (field.getClass().isArray() || field.getGenericType() instanceof List) {
+							predicateType = PredicateType.IN;
+						} else {
+							predicateType = PredicateType.EQ;
+						}
+					}
+
+					/*
+					 * 判断值是否在边界，默认集合数组非空，字符串非bank，数字类型大于0
+					 * 
+					 */
+
+					if (fieldValue == null) {
+						continue;
+					}
+
+					if (field.getClass().isArray()) {
+						if (Array.getLength(fieldValue) == 0) {
+							continue;
+						}
+					} else if (field.getGenericType() instanceof List) {
+						if (((List<?>) fieldValue).isEmpty()) {
+							continue;
+						}
+					} else if (field.getType().isAssignableFrom(String.class)) {
+						if (StringUtils.isBlank((String) fieldValue)) {
+							continue;
+						}
+					} else if (field.getType().isAssignableFrom(Number.class)) {
+						if (predicate.border() == null) {
+							if (((Number) fieldValue).longValue() <= 0) {
+								continue;
+							}
+						} else if (predicate.border() == PredicateBorder.ZERO) {
+							if (((Number) fieldValue).longValue() < 0) {
+								continue;
+							}
+						}
+					}
+
+					// SimpleExpression<?> simpleExpression = null;
+					Object simpleExpression = null;
+					// 生成条件
+					try {
+						simpleExpression = QueryBeanUtil.getFieldValueByClasss(filedName, meta);
+					} catch (Exception e) {
+						throw new RuntimeException(e);
+					}
+					try {
+
+						Method method = QueryBeanUtil.getDeclaredMethod1(simpleExpression,
+								predicateType.getFunctionName(), fieldValue);
+						method.setAccessible(true);
+						predicates.add((Predicate) method.invoke(simpleExpression, fieldValue));
+					} catch (Exception e) {
+						throw new RuntimeException(e);
+					}
+
+				}
+			}
+		}
+		return predicates;
+	}
+
+	/**
 	 * 将字符串转化为排序字段，_开头表示升序排列，否则降序排列
 	 * 
 	 * @param orderByFileds
@@ -93,7 +198,7 @@ public abstract class AbstractDao<M extends RelationalPathBase<E>, E, ID extends
 				String filed = orderByFileds[i];
 				try {
 					orders[i] = new OrderSpecifier<>(filed.startsWith("_") ? Order.ASC : Order.DESC,
-							(Path) QueryBeanUtil.getFieldValueByClasss(filed, meta));
+							(Path) QueryBeanUtil.getFieldValueByClasss(filed.replaceAll("^_", ""), meta));
 				} catch (Exception e) {
 					e.printStackTrace();
 					throw new RuntimeException(e);
@@ -102,6 +207,16 @@ public abstract class AbstractDao<M extends RelationalPathBase<E>, E, ID extends
 			return orders;
 		}
 		return null;
+	}
+	
+	
+
+	public OrderSpecifier<?>[] orderBy(String[] orderByFileds, String defaultOrderBy) {
+		if (ArrayUtils.isEmpty(orderByFileds)) {
+			return orderBy(new String[] { defaultOrderBy });
+		} else {
+			return orderBy(orderByFileds);
+		}
 	}
 
 	public E get(ID id) {
